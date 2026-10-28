@@ -1,26 +1,37 @@
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
     response::IntoResponse,
     routing::post,
     Json, Router,
 };
+use chrono::{DateTime, FixedOffset};
 use reqwest::Client;
 use serde::Deserialize;
 use std::env;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct TrapFallWebhook {
-    rule_id: String,
-    issue_id: String,
-    project_id: String,
-    title: String,
-    level: String,
-    count: u32,
     #[allow(dead_code)]
     action: String,
-    triggered_at: String,
+    rule: String,
+    issue: Issue,
+}
+
+#[derive(Debug, Deserialize)]
+struct Issue {
+    count: u32,
+    culprit: String,
+    id: String,
+    last_seen: String,
+    level: String,
+    #[allow(dead_code)]
+    project_id: String,
+    status: String,
+    title: String,
 }
 
 struct AppConfig {
@@ -28,22 +39,69 @@ struct AppConfig {
     feishu_webhook_url: String,
 }
 
+struct DedupCache {
+    seen_ids: Vec<(String, Instant)>,
+    ttl: Duration,
+}
+
+impl DedupCache {
+    fn new(ttl_secs: u64) -> Self {
+        Self {
+            seen_ids: Vec::new(),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    fn is_duplicate(&mut self, id: &str) -> bool {
+        let now = Instant::now();
+        self.seen_ids.retain(|(_, ts)| now.duration_since(*ts) < self.ttl);
+        if self.seen_ids.iter().any(|(sid, _)| sid == id) {
+            return true;
+        }
+        self.seen_ids.push((id.to_string(), now));
+        false
+    }
+}
+
+fn format_time(iso: &str) -> String {
+    match DateTime::parse_from_rfc3339(iso) {
+        Ok(dt) => {
+            let shanghai = FixedOffset::east_opt(8 * 3600).unwrap();
+            dt.with_timezone(&shanghai)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        }
+        Err(_) => iso.to_string(),
+    }
+}
+
+fn format_culprit(culprit: &str) -> String {
+    let parts: Vec<&str> = culprit.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [file, line, func] => format!("{}:{} ({})", file, line, func),
+        [file, line] => format!("{}:{}", file, line),
+        _ => culprit.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let listen = env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let feishu_webhook_url = env::var("FEISHU_WEBHOOK_URL")
-        .expect("FEISHU_WEBHOOK_URL must be set");
+    let feishu_webhook_url =
+        env::var("FEISHU_WEBHOOK_URL").expect("FEISHU_WEBHOOK_URL must be set");
 
     let config = Arc::new(AppConfig {
         listen,
         feishu_webhook_url,
     });
 
+    let dedup = Arc::new(Mutex::new(DedupCache::new(300)));
+
     println!("Listening on {}", config.listen);
 
     let app = Router::new()
         .route("/", post(handle_trapfall_alert))
-        .with_state(Arc::clone(&config));
+        .with_state((Arc::clone(&config), dedup));
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -55,20 +113,43 @@ async fn main() {
 }
 
 async fn handle_trapfall_alert(
-    State(config): State<Arc<AppConfig>>,
-    Json(trapfall_payload): Json<TrapFallWebhook>,
+    State((config, dedup)): State<(Arc<AppConfig>, Arc<Mutex<DedupCache>>)>,
+    payload: Result<Json<TrapFallWebhook>, JsonRejection>,
 ) -> impl IntoResponse {
-       // 打印 TrapFall 发来的原始 payload
+    let trapfall_payload = match payload {
+        Ok(Json(p)) => p,
+        Err(e) => {
+            eprintln!("TrapFall JSON parse failed: {}", e);
+            return StatusCode::UNPROCESSABLE_ENTITY;
+        }
+    };
+
     eprintln!("TrapFall payload: {:?}", trapfall_payload);
+
+    {
+        let mut cache = dedup.lock().await;
+        if cache.is_duplicate(&trapfall_payload.issue.id) {
+            eprintln!("Duplicate alert skipped: {}", trapfall_payload.issue.id);
+            return StatusCode::OK;
+        }
+    }
+
+    let prefix = match trapfall_payload.action.as_str() {
+        "triggered" | "webhook" => "【告警】",
+        "resolved" => "【恢复】",
+        _ => "【事件】",
+    };
+
     let msg_text = format!(
-        "【告警】TrapFall 触发告警\n规则ID: {}\nIssueID: {}\n项目ID: {}\n等级: {}\n标题: {}\n次数: {}\n时间: {}",
-        trapfall_payload.rule_id,
-        trapfall_payload.issue_id,
-        trapfall_payload.project_id,
-        trapfall_payload.level,
-        trapfall_payload.title,
-        trapfall_payload.count,
-        trapfall_payload.triggered_at
+        "{} TrapFall 触发告警\n规则: {}\n等级: {}\n标题: {}\n次数: {}\n定位: {}\n状态: {}\n最后出现: {}",
+        prefix,
+        trapfall_payload.rule,
+        trapfall_payload.issue.level,
+        trapfall_payload.issue.title,
+        trapfall_payload.issue.count,
+        format_culprit(&trapfall_payload.issue.culprit),
+        trapfall_payload.issue.status,
+        format_time(&trapfall_payload.issue.last_seen),
     );
 
     let feishu_payload = serde_json::json!({
