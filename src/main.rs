@@ -42,7 +42,7 @@ async fn main() {
 
     let app = Router::new().route("/", post(handle_trapfall_alert));
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind address");
     axum::serve(listener, app)
