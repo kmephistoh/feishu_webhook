@@ -1,0 +1,20 @@
+[Unit]
+Description=TrapFall to Feishu Webhook Adapter
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/feishu-webhook
+ExecStart=/usr/local/bin/feishu_webhook
+Restart=on-failure
+RestartSec=5
+Environment="PORT=3000"
+Environment="RUST_LOG=info"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=feishu-webhook
+
+[Install]
+WantedBy=multi-user.target
