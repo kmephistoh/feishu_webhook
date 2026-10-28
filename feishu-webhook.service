@@ -6,6 +6,8 @@ After=network.target
 Type=simple
 User=www-data
 Group=www-data
+Environment="LISTEN=127.0.0.1:3000"
+Environment="FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/76bf5d4c-753a-4bbf-bebb-40f9aeb1f576"
 WorkingDirectory=/opt/feishu-webhook
 ExecStart=/usr/local/bin/feishu_webhook
 Restart=on-failure
