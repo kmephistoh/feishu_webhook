@@ -58,6 +58,8 @@ async fn handle_trapfall_alert(
     State(config): State<Arc<AppConfig>>,
     Json(trapfall_payload): Json<TrapFallWebhook>,
 ) -> impl IntoResponse {
+       // 打印 TrapFall 发来的原始 payload
+    eprintln!("TrapFall payload: {:?}", trapfall_payload);
     let msg_text = format!(
         "【告警】TrapFall 触发告警\n规则ID: {}\nIssueID: {}\n项目ID: {}\n等级: {}\n标题: {}\n次数: {}\n时间: {}",
         trapfall_payload.rule_id,
